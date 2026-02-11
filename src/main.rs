@@ -24,8 +24,6 @@ struct RamMapApp {
     show_drop: bool,
     /// Whether to show Free regions.
     show_free: bool,
-    /// Gap threshold in KiB (UI control).
-    gap_threshold_kib: u64,
     /// Whether layout needs recomputation.
     dirty: bool,
     /// File path to load.
@@ -45,7 +43,6 @@ impl RamMapApp {
             selected_region: None,
             show_drop: true,
             show_free: true,
-            gap_threshold_kib: 64,
             dirty: true,
             file_path,
             last_map_width: 0.0,
@@ -69,8 +66,6 @@ impl RamMapApp {
     }
 
     fn recompute_layout(&mut self, map_width: f32, available_height: f32) {
-        self.layout_config.gap_threshold = self.gap_threshold_kib * 1024;
-
         // Filter regions based on visibility settings.
         let filtered: Vec<MemoryRegion> = self
             .regions
@@ -114,16 +109,6 @@ impl eframe::App for RamMapApp {
                     self.dirty = true;
                 }
                 if ui.checkbox(&mut self.show_drop, "Drop").changed() {
-                    self.dirty = true;
-                }
-                ui.separator();
-                ui.label("Gap threshold:");
-                let mut kib = self.gap_threshold_kib as f32;
-                let slider = egui::Slider::new(&mut kib, 4.0..=4096.0)
-                    .suffix(" KiB")
-                    .logarithmic(true);
-                if ui.add(slider).changed() {
-                    self.gap_threshold_kib = kib as u64;
                     self.dirty = true;
                 }
             });

@@ -6,7 +6,7 @@
 // (512 KiB) can coexist visually. Each row is stretched to fill the full
 // available width — no dead space.
 
-use crate::input::{MemoryRegion, MemoryType, RegionStatus};
+use crate::input::MemoryRegion;
 
 /// A visual block to be rendered in the map.
 #[derive(Debug, Clone)]
@@ -100,16 +100,11 @@ fn format_size_compact(bytes: u64) -> String {
 }
 
 /// Layout configuration.
-pub struct LayoutConfig {
-    /// Gaps larger than this are compressed. Default: 64 KiB.
-    pub gap_threshold: u64,
-}
+pub struct LayoutConfig {}
 
 impl Default for LayoutConfig {
     fn default() -> Self {
-        Self {
-            gap_threshold: 64 * 1024,
-        }
+        Self {}
     }
 }
 
@@ -124,7 +119,10 @@ pub struct VisualRow {
 }
 
 /// Build the flat list of blocks (regions + gaps) from the sorted region list.
-pub fn build_blocks(regions: &[MemoryRegion], config: &LayoutConfig) -> Vec<VisualBlock> {
+///
+/// Holes in the address space (addresses not covered by any region) become
+/// `VisualBlock::Gap` entries. Free regions are kept as normal region blocks.
+pub fn build_blocks(regions: &[MemoryRegion], _config: &LayoutConfig) -> Vec<VisualBlock> {
     if regions.is_empty() {
         return Vec::new();
     }
@@ -133,45 +131,19 @@ pub fn build_blocks(regions: &[MemoryRegion], config: &LayoutConfig) -> Vec<Visu
     let mut frontier = regions[0].start;
 
     for region in regions {
-        // Insert gap before this region if needed.
+        // Insert a gap block for any hole in the address space.
         if region.start > frontier {
-            let gap_size = region.start - frontier;
-            if gap_size > config.gap_threshold {
-                entries.push(VisualBlock::Gap {
-                    start: frontier,
-                    end: region.start,
-                    px_width: 0.0,
-                });
-            } else {
-                // Small gap — show as a thin free region.
-                entries.push(VisualBlock::Region {
-                    region: MemoryRegion {
-                        start: frontier,
-                        end: region.start,
-                        status: RegionStatus::Free,
-                        mem_type: MemoryType::Cached,
-                        permissions: String::new(),
-                        name: "(gap)".into(),
-                    },
-                    px_width: 0.0,
-                });
-            }
+            entries.push(VisualBlock::Gap {
+                start: frontier,
+                end: region.start,
+                px_width: 0.0,
+            });
         }
 
-        // Compress large Free regions the same as gaps.
-        let size = region.size();
-        if region.status == RegionStatus::Free && size > config.gap_threshold {
-            entries.push(VisualBlock::Gap {
-                start: region.start,
-                end: region.end,
-                px_width: 0.0,
-            });
-        } else {
-            entries.push(VisualBlock::Region {
-                region: region.clone(),
-                px_width: 0.0,
-            });
-        }
+        entries.push(VisualBlock::Region {
+            region: region.clone(),
+            px_width: 0.0,
+        });
 
         if region.end > frontier {
             frontier = region.end;
