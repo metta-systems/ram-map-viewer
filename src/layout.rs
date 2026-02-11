@@ -33,13 +33,6 @@ impl VisualBlock {
         }
     }
 
-    pub fn end(&self) -> u64 {
-        match self {
-            VisualBlock::Region { region, .. } => region.end,
-            VisualBlock::Gap { end, .. } => *end,
-        }
-    }
-
     pub fn display_width(&self) -> f64 {
         match self {
             VisualBlock::Region { display_width, .. } => *display_width,

@@ -158,9 +158,14 @@ impl eframe::App for RamMapApp {
 
 impl RamMapApp {
     fn draw_map(&mut self, ui: &mut egui::Ui, map_width: f32) {
-        let row_height = 36.0;
         let row_spacing = 4.0;
         let gutter_width = 115.0;
+
+        // Compute row height dynamically to fill available vertical space.
+        let avail_height = ui.available_height() - 60.0; // reserve for legend
+        let num_rows = self.rows.len().max(1);
+        let row_height =
+            ((avail_height - row_spacing * num_rows as f32) / num_rows as f32).clamp(28.0, 120.0);
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -249,14 +254,13 @@ impl RamMapApp {
                                         );
                                     }
 
-                                    // Label if wide enough.
+                                    // Label: choose horizontal or vertical based on aspect ratio.
                                     if w > 40.0 {
+                                        // Horizontal label (wide enough)
                                         let label = if w > 120.0 {
                                             region.name.clone()
-                                        } else if w > 60.0 {
-                                            truncate_label(&region.name, (w / 7.0) as usize)
                                         } else {
-                                            truncate_label(&region.name, 4)
+                                            truncate_label(&region.name, (w / 7.0) as usize)
                                         };
                                         let text_color = label_color_for_bg(bg);
                                         painter.text(
@@ -266,13 +270,36 @@ impl RamMapApp {
                                             egui::FontId::proportional(11.0),
                                             text_color,
                                         );
+                                    } else if row_height > 40.0 && w > 12.0 {
+                                        // Vertical label for narrow-but-tall blocks.
+                                        let max_chars = (row_height / 8.0) as usize;
+                                        let label = truncate_label(&region.name, max_chars.max(3));
+                                        let text_color = label_color_for_bg(bg);
+
+                                        // Draw each character stacked vertically. (TODO: draw text rotated 90 degrees)
+                                        let char_h = 11.0;
+                                        let total_h = label.chars().count() as f32 * char_h;
+                                        let start_y = rect.center().y - total_h / 2.0;
+
+                                        for (ci, ch) in label.chars().enumerate() {
+                                            painter.text(
+                                                Pos2::new(
+                                                    rect.center().x,
+                                                    start_y + ci as f32 * char_h + char_h / 2.0,
+                                                ),
+                                                egui::Align2::CENTER_CENTER,
+                                                ch.to_string(),
+                                                egui::FontId::proportional(10.0),
+                                                text_color,
+                                            );
+                                        }
                                     }
 
                                     // Hover detection.
-                                    if let Some(pointer) = ui.input(|i| i.pointer.hover_pos()) {
-                                        if rect.contains(pointer) {
-                                            hovered = self.find_region_index(region);
-                                        }
+                                    if let Some(pointer) = ui.input(|i| i.pointer.hover_pos())
+                                        && rect.contains(pointer)
+                                    {
+                                        hovered = self.find_region_index(region);
                                     }
                                 }
                                 VisualBlock::Gap { start, end, .. } => {
