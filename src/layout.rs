@@ -100,13 +100,8 @@ fn format_size_compact(bytes: u64) -> String {
 }
 
 /// Layout configuration.
+#[derive(Default)]
 pub struct LayoutConfig {}
-
-impl Default for LayoutConfig {
-    fn default() -> Self {
-        Self {}
-    }
-}
 
 /// A row of visual blocks with pixel widths that sum to exactly `row_px`.
 #[derive(Debug, Clone)]
