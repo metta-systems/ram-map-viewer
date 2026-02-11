@@ -9,3 +9,9 @@ repository = "https://github.com/metta-systems/ram-map-viewer"
 [dependencies]
 eframe = "0.33"
 egui = "0.33"
+
+[profile.release]
+opt-level = "s"
+codegen-units = 1
+lto = true
+strip = "symbols"
