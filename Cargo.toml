@@ -1,0 +1,11 @@
+[package]
+name = "ram-map-viewer"
+description = "Graphical viewer for a simple format memory map"
+version = "0.1.0"
+edition = "2024"
+license = "BlueOak-1.0.0"
+repository = "https://github.com/metta-systems/ram-map-viewer"
+
+[dependencies]
+eframe = "0.33"
+egui = "0.33"
