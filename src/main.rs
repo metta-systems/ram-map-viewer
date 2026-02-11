@@ -13,7 +13,6 @@ mod layout;
 /// Application state.
 struct RamMapApp {
     regions: Vec<MemoryRegion>,
-    blocks: Vec<VisualBlock>,
     rows: Vec<VisualRow>,
     layout_config: LayoutConfig,
     error: Option<String>,
@@ -31,13 +30,14 @@ struct RamMapApp {
     dirty: bool,
     /// File path to load.
     file_path: String,
+    /// Cached available width for detecting resize.
+    last_map_width: f32,
 }
 
 impl RamMapApp {
     fn new(file_path: String) -> Self {
         let mut app = Self {
             regions: Vec::new(),
-            blocks: Vec::new(),
             rows: Vec::new(),
             layout_config: LayoutConfig::default(),
             error: None,
@@ -48,6 +48,7 @@ impl RamMapApp {
             gap_threshold_kib: 64,
             dirty: true,
             file_path,
+            last_map_width: 0.0,
         };
         app.reload();
         app
@@ -67,7 +68,7 @@ impl RamMapApp {
         }
     }
 
-    fn recompute_layout(&mut self, row_width_px: f32) {
+    fn recompute_layout(&mut self, map_width: f32) {
         self.layout_config.gap_threshold = self.gap_threshold_kib * 1024;
 
         // Filter regions based on visibility settings.
@@ -86,12 +87,9 @@ impl RamMapApp {
             .cloned()
             .collect();
 
-        self.blocks = layout::compute_layout(&filtered, &mut self.layout_config);
-
-        // Row width in layout units: we want to fill `row_width_px` pixels.
-        // Each layout unit maps to ~1 pixel (we'll scale during rendering).
-        let row_width_units = (row_width_px as f64).max(200.0);
-        self.rows = layout::wrap_into_rows(&self.blocks, row_width_units);
+        let blocks = layout::build_blocks(&filtered, &self.layout_config);
+        self.rows = layout::layout_rows(blocks, map_width, &self.layout_config);
+        self.last_map_width = map_width;
         self.dirty = false;
     }
 
@@ -146,207 +144,218 @@ impl eframe::App for RamMapApp {
                 return;
             }
 
-            let avail_width = ui.available_width() - 120.0; // leave room for address gutter
-            if self.dirty {
-                self.recompute_layout(avail_width);
+            let gutter_width = 130.0;
+            let map_width = (ui.available_width() - gutter_width - 16.0).max(100.0);
+
+            // Recompute if dirty or if width changed significantly.
+            if self.dirty || (self.last_map_width - map_width).abs() > 2.0 {
+                self.recompute_layout(map_width);
             }
 
-            self.draw_map(ui, avail_width);
+            self.draw_map(ui, map_width, gutter_width);
         });
     }
 }
 
 impl RamMapApp {
-    fn draw_map(&mut self, ui: &mut egui::Ui, map_width: f32) {
-        let row_spacing = 4.0;
-        let gutter_width = 115.0;
+    fn draw_map(&mut self, ui: &mut egui::Ui, map_width: f32, gutter_width: f32) {
+        let row_spacing = 3.0;
+        let num_rows = self.rows.len().max(1) as f32;
 
-        // Compute row height dynamically to fill available vertical space.
-        let avail_height = ui.available_height() - 60.0; // reserve for legend
-        let num_rows = self.rows.len().max(1);
-        let row_height =
-            ((avail_height - row_spacing * num_rows as f32) / num_rows as f32).clamp(28.0, 120.0);
+        // Compute row height to fill available vertical space.
+        let legend_height = 40.0;
+        let avail_height = ui.available_height() - legend_height;
+        let row_height = ((avail_height - row_spacing * num_rows) / num_rows).clamp(28.0, 120.0);
+
+        let total_width = gutter_width + map_width;
+        let total_height = num_rows * (row_height + row_spacing) + legend_height;
+
+        // Clone rows to avoid borrow conflict.
+        let rows = self.rows.clone();
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                // Allocate a single painter for the entire map area.
+                let (response, painter) = ui.allocate_painter(
+                    Vec2::new(total_width, total_height - legend_height),
+                    Sense::hover(),
+                );
+                let origin = response.rect.min;
+                let pointer = ui.input(|i| i.pointer.hover_pos());
+
                 let mut hovered = None;
 
-                for row in &self.rows {
+                for (row_idx, row) in rows.iter().enumerate() {
                     if row.blocks.is_empty() {
                         continue;
                     }
 
-                    // Compute scale: row's total_width (layout units) → map_width pixels.
-                    let scale = if row.total_width > 0.0 {
-                        map_width as f64 / row.total_width
-                    } else {
-                        1.0
-                    };
+                    let row_y = origin.y + row_idx as f32 * (row_height + row_spacing);
+                    let blocks_x = origin.x + gutter_width;
 
-                    // Address label for the row start.
+                    // --- Address gutter ---
                     let row_start_addr = row.blocks.first().map(|b| b.start()).unwrap_or(0);
+                    let addr_text = format_addr(row_start_addr);
+                    let gutter_center =
+                        Pos2::new(origin.x + gutter_width - 8.0, row_y + row_height / 2.0);
+                    painter.text(
+                        gutter_center,
+                        egui::Align2::RIGHT_CENTER,
+                        &addr_text,
+                        egui::FontId::monospace(11.0),
+                        Color32::from_rgb(180, 180, 190),
+                    );
 
-                    ui.horizontal(|ui| {
-                        // Address gutter.
-                        ui.allocate_ui(Vec2::new(gutter_width, row_height), |ui| {
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.monospace(format_addr(row_start_addr));
-                                },
-                            );
-                        });
+                    // --- Blocks ---
+                    let mut x = 0.0_f32;
+                    for block in &row.blocks {
+                        let w = block.px_width();
+                        let rect = Rect::from_min_size(
+                            Pos2::new(blocks_x + x, row_y),
+                            Vec2::new(w, row_height),
+                        );
 
-                        // The blocks in this row.
-                        let (response, painter) =
-                            ui.allocate_painter(Vec2::new(map_width, row_height), Sense::hover());
-                        let origin = response.rect.min;
+                        match block {
+                            VisualBlock::Region { region, .. } => {
+                                let bg = region_color(region);
+                                let is_hovered = self
+                                    .hovered_region
+                                    .and_then(|idx| self.regions.get(idx))
+                                    .map(|hr| {
+                                        hr.start == region.start
+                                            && hr.end == region.end
+                                            && hr.name == region.name
+                                    })
+                                    .unwrap_or(false);
+                                let is_selected = self
+                                    .selected_region
+                                    .and_then(|idx| self.regions.get(idx))
+                                    .map(|sr| {
+                                        sr.start == region.start
+                                            && sr.end == region.end
+                                            && sr.name == region.name
+                                    })
+                                    .unwrap_or(false);
 
-                        let mut x = 0.0_f64;
-                        for block in &row.blocks {
-                            let w = (block.display_width() * scale) as f32;
-                            let rect = Rect::from_min_size(
-                                Pos2::new(origin.x + x as f32, origin.y),
-                                Vec2::new(w, row_height),
-                            );
+                                // Draw filled rect.
+                                painter.rect_filled(rect, CornerRadius::same(2), bg);
 
-                            match block {
-                                VisualBlock::Region { region, .. } => {
-                                    let bg = region_color(region);
-                                    let is_hovered = self
-                                        .hovered_region
-                                        .and_then(|idx| self.regions.get(idx))
-                                        .map(|hr| {
-                                            hr.start == region.start
-                                                && hr.end == region.end
-                                                && hr.name == region.name
-                                        })
-                                        .unwrap_or(false);
-                                    let is_selected = self
-                                        .selected_region
-                                        .and_then(|idx| self.regions.get(idx))
-                                        .map(|sr| {
-                                            sr.start == region.start
-                                                && sr.end == region.end
-                                                && sr.name == region.name
-                                        })
-                                        .unwrap_or(false);
-
-                                    let highlight = if is_selected {
-                                        Color32::WHITE
-                                    } else if is_hovered {
-                                        Color32::from_rgba_premultiplied(255, 255, 255, 60)
-                                    } else {
-                                        Color32::TRANSPARENT
-                                    };
-
-                                    painter.rect_filled(rect, CornerRadius::same(2), bg);
-                                    if highlight != Color32::TRANSPARENT {
-                                        painter.rect_stroke(
-                                            rect,
-                                            CornerRadius::same(2),
-                                            Stroke::new(
-                                                if is_selected { 2.0 } else { 1.0 },
-                                                highlight,
-                                            ),
-                                            StrokeKind::Outside,
-                                        );
-                                    }
-
-                                    // Label: choose horizontal or vertical based on aspect ratio.
-                                    if w > 40.0 {
-                                        // Horizontal label (wide enough)
-                                        let label = if w > 120.0 {
-                                            region.name.clone()
-                                        } else {
-                                            truncate_label(&region.name, (w / 7.0) as usize)
-                                        };
-                                        let text_color = label_color_for_bg(bg);
-                                        painter.text(
-                                            rect.center(),
-                                            egui::Align2::CENTER_CENTER,
-                                            label,
-                                            egui::FontId::proportional(11.0),
-                                            text_color,
-                                        );
-                                    } else if row_height > 40.0 && w > 12.0 {
-                                        // Vertical label for narrow-but-tall blocks.
-                                        let max_chars = (row_height / 8.0) as usize;
-                                        let label = truncate_label(&region.name, max_chars.max(3));
-                                        let text_color = label_color_for_bg(bg);
-
-                                        // Draw each character stacked vertically. (TODO: draw text rotated 90 degrees)
-                                        let char_h = 11.0;
-                                        let total_h = label.chars().count() as f32 * char_h;
-                                        let start_y = rect.center().y - total_h / 2.0;
-
-                                        for (ci, ch) in label.chars().enumerate() {
-                                            painter.text(
-                                                Pos2::new(
-                                                    rect.center().x,
-                                                    start_y + ci as f32 * char_h + char_h / 2.0,
-                                                ),
-                                                egui::Align2::CENTER_CENTER,
-                                                ch.to_string(),
-                                                egui::FontId::proportional(10.0),
-                                                text_color,
-                                            );
-                                        }
-                                    }
-
-                                    // Hover detection.
-                                    if let Some(pointer) = ui.input(|i| i.pointer.hover_pos())
-                                        && rect.contains(pointer)
-                                    {
-                                        hovered = self.find_region_index(region);
-                                    }
+                                // Highlight border.
+                                if is_selected {
+                                    painter.rect_stroke(
+                                        rect,
+                                        CornerRadius::same(2),
+                                        Stroke::new(2.0, Color32::WHITE),
+                                        StrokeKind::Outside,
+                                    );
+                                } else if is_hovered {
+                                    painter.rect_stroke(
+                                        rect,
+                                        CornerRadius::same(2),
+                                        Stroke::new(
+                                            1.0,
+                                            Color32::from_rgba_premultiplied(255, 255, 255, 80),
+                                        ),
+                                        StrokeKind::Outside,
+                                    );
                                 }
-                                VisualBlock::Gap { start, end, .. } => {
-                                    // Draw gap marker: dark rect with zigzag or "//" text.
-                                    painter.rect_filled(rect, CornerRadius::same(2), gap_color());
-                                    // Diagonal lines pattern.
-                                    let stripe_spacing = 6.0;
-                                    let clip = rect;
-                                    let mut sx = rect.min.x;
-                                    while sx < rect.max.x + row_height {
-                                        let p1 = Pos2::new(sx, rect.max.y);
-                                        let p2 = Pos2::new(sx + row_height, rect.min.y);
-                                        // Clip manually: just draw, painter clips.
-                                        painter.line_segment(
-                                            [
-                                                Pos2::new(
-                                                    p1.x.max(clip.min.x),
-                                                    p1.y.min(clip.max.y),
-                                                ),
-                                                Pos2::new(
-                                                    p2.x.min(clip.max.x),
-                                                    p2.y.max(clip.min.y),
-                                                ),
-                                            ],
-                                            Stroke::new(1.0, Color32::from_rgb(70, 70, 80)),
-                                        );
-                                        sx += stripe_spacing;
-                                    }
 
-                                    // Size label.
-                                    let gap_size = end - start;
-                                    let label = format!("⋯ {} ⋯", format_size(gap_size));
+                                // Label: horizontal if wide enough, vertical if tall enough.
+                                let text_color = label_color_for_bg(bg);
+                                if w > 50.0 {
+                                    // Horizontal label.
+                                    let max_chars = ((w - 8.0) / 7.0) as usize;
+                                    let label = truncate_label(&region.name, max_chars.max(3));
                                     painter.text(
                                         rect.center(),
                                         egui::Align2::CENTER_CENTER,
                                         label,
-                                        egui::FontId::proportional(10.0),
-                                        Color32::from_rgb(140, 140, 150),
+                                        egui::FontId::proportional(11.0),
+                                        text_color,
+                                    );
+                                    // Size label below name if there's room.
+                                    if row_height > 36.0 && w > 60.0 {
+                                        let size_str = format_size(region.size());
+                                        painter.text(
+                                            Pos2::new(rect.center().x, rect.center().y + 13.0),
+                                            egui::Align2::CENTER_CENTER,
+                                            size_str,
+                                            egui::FontId::proportional(9.0),
+                                            Color32::from_rgba_premultiplied(
+                                                text_color.r(),
+                                                text_color.g(),
+                                                text_color.b(),
+                                                160,
+                                            ),
+                                        );
+                                    }
+                                } else if row_height > 50.0 && w > 14.0 {
+                                    // Vertical label for narrow-but-tall blocks.
+                                    let max_chars = ((row_height - 8.0) / 11.0) as usize;
+                                    let label = truncate_label(&region.name, max_chars.max(2));
+                                    let char_h = 11.0;
+                                    let chars: Vec<char> = label.chars().collect();
+                                    let total_h = chars.len() as f32 * char_h;
+                                    let start_y = rect.center().y - total_h / 2.0;
+
+                                    for (ci, ch) in chars.iter().enumerate() {
+                                        painter.text(
+                                            Pos2::new(
+                                                rect.center().x,
+                                                start_y + ci as f32 * char_h + char_h / 2.0,
+                                            ),
+                                            egui::Align2::CENTER_CENTER,
+                                            ch.to_string(),
+                                            egui::FontId::proportional(10.0),
+                                            text_color,
+                                        );
+                                    }
+                                }
+
+                                // Hover detection.
+                                if let Some(pos) = pointer
+                                    && rect.contains(pos)
+                                {
+                                    hovered = self.find_region_index(region);
+                                }
+                            }
+                            VisualBlock::Gap { start, end, .. } => {
+                                // Dark rect with diagonal stripes.
+                                painter.rect_filled(rect, CornerRadius::same(2), gap_color());
+
+                                let stripe_spacing = 8.0;
+                                let mut sx = rect.min.x - row_height;
+                                while sx < rect.max.x + row_height {
+                                    let p1 = Pos2::new(sx, rect.max.y);
+                                    let p2 = Pos2::new(sx + row_height, rect.min.y);
+                                    painter.line_segment(
+                                        [
+                                            Pos2::new(p1.x.max(rect.min.x), p1.y.min(rect.max.y)),
+                                            Pos2::new(p2.x.min(rect.max.x), p2.y.max(rect.min.y)),
+                                        ],
+                                        Stroke::new(1.0, Color32::from_rgb(60, 60, 70)),
+                                    );
+                                    sx += stripe_spacing;
+                                }
+
+                                // Size label.
+                                if w > 30.0 {
+                                    let gap_size = end - start;
+                                    let label = format_size(gap_size);
+                                    painter.text(
+                                        rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        label,
+                                        egui::FontId::proportional(9.0),
+                                        Color32::from_rgb(120, 120, 130),
                                     );
                                 }
                             }
-
-                            x += w as f64;
                         }
-                    });
 
-                    ui.add_space(row_spacing);
+                        x += w;
+                    }
                 }
 
                 self.hovered_region = hovered;
@@ -382,7 +391,7 @@ impl RamMapApp {
                 }
 
                 // Legend at the bottom.
-                ui.add_space(16.0);
+                ui.add_space(8.0);
                 ui.separator();
                 ui.horizontal_wrapped(|ui| {
                     legend_swatch(ui, Color32::from_rgb(70, 130, 220), "Code");
@@ -395,7 +404,7 @@ impl RamMapApp {
                     legend_swatch(ui, Color32::from_rgb(140, 100, 60), "Init/Boot");
                     legend_swatch(ui, Color32::from_rgb(170, 130, 90), "DTB");
                     legend_swatch(ui, Color32::from_rgb(60, 60, 70), "Free");
-                    legend_swatch(ui, gap_color(), "Gap (compressed)");
+                    legend_swatch(ui, gap_color(), "Gap");
                 });
             });
     }
