@@ -2,7 +2,7 @@ use {
     colors::*,
     eframe::egui,
     egui::{Color32, CornerRadius, PopupAnchor, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2},
-    input::{FileSource, MemoryRegion, MemorySource, RegionStatus},
+    input::{FileSource, MemoryRegion, MemorySource, MemoryType, RegionStatus},
     layout::{LayoutConfig, VisualBlock, VisualRow},
 };
 
@@ -24,6 +24,10 @@ struct RamMapApp {
     show_drop: bool,
     /// Whether to show Free regions.
     show_free: bool,
+    /// Whether to show Used regions.
+    show_used: bool,
+    /// Whether to show Device/MMIO regions.
+    show_device: bool,
     /// Whether layout needs recomputation.
     dirty: bool,
     /// File path to load.
@@ -43,6 +47,8 @@ impl RamMapApp {
             selected_region: None,
             show_drop: true,
             show_free: true,
+            show_used: true,
+            show_device: true,
             dirty: true,
             file_path,
             last_map_width: 0.0,
@@ -71,13 +77,18 @@ impl RamMapApp {
             .regions
             .iter()
             .filter(|r| {
-                if !self.show_drop && r.status == RegionStatus::Drop {
-                    return false;
+                let is_device = r.mem_type == MemoryType::Device;
+                // Device/MMIO toggle takes precedence: device regions are
+                // controlled solely by show_device, non-device regions by
+                // the status toggles.
+                if is_device {
+                    return self.show_device;
                 }
-                if !self.show_free && r.status == RegionStatus::Free {
-                    return false;
+                match r.status {
+                    RegionStatus::Drop => self.show_drop,
+                    RegionStatus::Free => self.show_free,
+                    RegionStatus::Used => self.show_used,
                 }
-                true
             })
             .cloned()
             .collect();
@@ -108,7 +119,13 @@ impl eframe::App for RamMapApp {
                 if ui.checkbox(&mut self.show_free, "Free").changed() {
                     self.dirty = true;
                 }
+                if ui.checkbox(&mut self.show_used, "Used").changed() {
+                    self.dirty = true;
+                }
                 if ui.checkbox(&mut self.show_drop, "Drop").changed() {
+                    self.dirty = true;
+                }
+                if ui.checkbox(&mut self.show_device, "Device/MMIO").changed() {
                     self.dirty = true;
                 }
             });
@@ -410,8 +427,8 @@ impl RamMapApp {
                             format_size(region.size()),
                             status_label(region.status),
                             match region.mem_type {
-                                input::MemoryType::Cached => "Cached",
-                                input::MemoryType::Device => "Device",
+                                MemoryType::Cached => "Cached",
+                                MemoryType::Device => "Device",
                             },
                             region.permissions,
                         ));
