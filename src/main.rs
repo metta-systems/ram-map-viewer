@@ -184,6 +184,19 @@ impl RamMapApp {
                 let origin = response.rect.min;
                 let pointer = ui.input(|i| i.pointer.hover_pos());
 
+                // Compute total address range across all rows for the gutter indicator.
+                let total_start = rows
+                    .first()
+                    .and_then(|r| r.blocks.first())
+                    .map(|b| b.start())
+                    .unwrap_or(0);
+                let total_end = rows
+                    .last()
+                    .and_then(|r| r.blocks.last())
+                    .map(|b| b.end())
+                    .unwrap_or(1);
+                let total_span = (total_end - total_start).max(1) as f64;
+
                 let mut hovered = None;
                 let mut row_y = origin.y;
 
@@ -206,6 +219,33 @@ impl RamMapApp {
                         &addr_text,
                         egui::FontId::monospace(11.0),
                         Color32::from_rgb(180, 180, 190),
+                    );
+                    // Gutter indicator: a line showing which part of the total address space this row covers.
+                    let indicator_width = gutter_width - 16.0;
+                    let indicator_x = origin.x + 4.0;
+                    let indicator_y = row_y + row_height / 2.0 + 10.0;
+
+                    let row_start_frac = (row_start_addr - total_start) as f64 / total_span;
+                    let row_end_addr = row.blocks.last().map(|b| b.end()).unwrap_or(row_start_addr);
+                    let row_end_frac = (row_end_addr - total_start) as f64 / total_span;
+
+                    // Gray background line (full span).
+                    painter.line_segment(
+                        [
+                            Pos2::new(indicator_x, indicator_y),
+                            Pos2::new(indicator_x + indicator_width, indicator_y),
+                        ],
+                        Stroke::new(2.0, Color32::from_rgb(60, 60, 70)),
+                    );
+                    // Green highlight for this row's portion.
+                    let highlight_start = indicator_x + (row_start_frac as f32 * indicator_width);
+                    let highlight_end = indicator_x + (row_end_frac as f32 * indicator_width);
+                    painter.line_segment(
+                        [
+                            Pos2::new(highlight_start, indicator_y),
+                            Pos2::new(highlight_end.max(highlight_start + 2.0), indicator_y),
+                        ],
+                        Stroke::new(2.0, Color32::from_rgb(80, 170, 80)),
                     );
 
                     // --- Blocks ---
