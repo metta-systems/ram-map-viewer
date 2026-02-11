@@ -29,6 +29,13 @@ impl VisualBlock {
         }
     }
 
+    pub fn end(&self) -> u64 {
+        match self {
+            VisualBlock::Region { region, .. } => region.end,
+            VisualBlock::Gap { end, .. } => *end,
+        }
+    }
+
     pub fn px_width(&self) -> f32 {
         match self {
             VisualBlock::Region { px_width, .. } => *px_width,
@@ -110,6 +117,10 @@ impl Default for LayoutConfig {
 #[derive(Debug, Clone)]
 pub struct VisualRow {
     pub blocks: Vec<VisualBlock>,
+    /// Address range this row covers (end of last block - start of first block).
+    pub address_span: u64,
+    /// Computed pixel height (proportional to address_span relative to other rows).
+    pub height_px: f32,
 }
 
 /// Build the flat list of blocks (regions + gaps) from the sorted region list.
@@ -170,16 +181,21 @@ pub fn build_blocks(regions: &[MemoryRegion], config: &LayoutConfig) -> Vec<Visu
     entries
 }
 
-/// Wrap blocks into rows and assign pixel widths.
+/// Wrap blocks into rows and assign pixel widths and heights.
 ///
 /// **Text-driven layout**: each block needs enough width to show its label.
 /// Rows are filled greedily — a block is added to the current row as long as
 /// all blocks in the row can still fit at their minimum readable width.
 /// After row assignment, surplus pixels are distributed proportionally to
 /// each block's size bonus, so larger regions appear visually bigger.
+///
+/// **Address-proportional heights**: each row's height is proportional to the
+/// address range it covers (using log scale to prevent one huge gap from
+/// dominating). This makes rows spanning large address ranges visually taller.
 pub fn layout_rows(
     blocks: Vec<VisualBlock>,
     row_px: f32,
+    available_height: f32,
     _config: &LayoutConfig,
 ) -> Vec<VisualRow> {
     if blocks.is_empty() {
@@ -209,14 +225,90 @@ pub fn layout_rows(
         row_groups.push(current);
     }
 
-    // Step 2: for each row, assign pixel widths.
-    // Base width = min_readable_px, then distribute surplus proportionally
-    // to size_bonus.
+    // Step 2: assign pixel widths per row.
     let mut rows: Vec<VisualRow> = Vec::new();
 
     for mut group in row_groups {
         assign_text_driven_widths(&mut group, row_px);
-        rows.push(VisualRow { blocks: group });
+
+        // Compute address span for this row.
+        let row_start = group.first().map(|b| b.start()).unwrap_or(0);
+        let row_end = group.last().map(|b| b.end()).unwrap_or(0);
+        let address_span = row_end.saturating_sub(row_start).max(1);
+
+        rows.push(VisualRow {
+            blocks: group,
+            address_span,
+            height_px: 0.0, // computed below
+        });
+    }
+
+    // Step 3: compute row heights proportional to address span (log scale).
+    // Using log prevents a single row with a huge gap from eating all vertical space.
+    let min_row_height = 28.0_f32;
+    let max_row_height = available_height * 0.6; // no single row takes >60%
+    let row_spacing = 3.0;
+    let total_spacing = row_spacing * (rows.len().saturating_sub(1)) as f32;
+    let usable_height = (available_height - total_spacing).max(rows.len() as f32 * min_row_height);
+
+    let log_spans: Vec<f64> = rows
+        .iter()
+        .map(|r| (r.address_span as f64).ln_1p()) // ln(1 + span) for smooth scaling
+        .collect();
+    let total_log: f64 = log_spans.iter().sum();
+
+    if total_log > 0.0 {
+        // First pass: proportional heights.
+        let mut heights: Vec<f32> = log_spans
+            .iter()
+            .map(|ls| ((ls / total_log) * usable_height as f64) as f32)
+            .collect();
+
+        // Second pass: enforce min/max, redistribute.
+        let mut clamped_total = 0.0_f32;
+        let mut flexible_log = 0.0_f64;
+        for (i, h) in heights.iter_mut().enumerate() {
+            if *h < min_row_height {
+                clamped_total += min_row_height - *h;
+                *h = min_row_height;
+            } else if *h > max_row_height {
+                clamped_total -= *h - max_row_height;
+                *h = max_row_height;
+            } else {
+                flexible_log += log_spans[i];
+            }
+        }
+        // Redistribute clamping debt/surplus among flexible rows.
+        if clamped_total.abs() > 0.1 && flexible_log > 0.0 {
+            for (i, h) in heights.iter_mut().enumerate() {
+                if *h > min_row_height && *h < max_row_height {
+                    let share = (log_spans[i] / flexible_log) as f32 * clamped_total;
+                    *h = (*h - share).clamp(min_row_height, max_row_height);
+                }
+            }
+        }
+
+        // Final correction for fp drift.
+        let sum: f32 = heights.iter().sum();
+        let correction = usable_height - sum;
+        if let Some(tallest) = heights
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i)
+        {
+            heights[tallest] = (heights[tallest] + correction).max(min_row_height);
+        }
+
+        for (row, h) in rows.iter_mut().zip(heights.iter()) {
+            row.height_px = *h;
+        }
+    } else {
+        // Fallback: equal heights.
+        let h = usable_height / rows.len() as f32;
+        for row in &mut rows {
+            row.height_px = h;
+        }
     }
 
     rows

@@ -68,7 +68,7 @@ impl RamMapApp {
         }
     }
 
-    fn recompute_layout(&mut self, map_width: f32) {
+    fn recompute_layout(&mut self, map_width: f32, available_height: f32) {
         self.layout_config.gap_threshold = self.gap_threshold_kib * 1024;
 
         // Filter regions based on visibility settings.
@@ -88,7 +88,7 @@ impl RamMapApp {
             .collect();
 
         let blocks = layout::build_blocks(&filtered, &self.layout_config);
-        self.rows = layout::layout_rows(blocks, map_width, &self.layout_config);
+        self.rows = layout::layout_rows(blocks, map_width, available_height, &self.layout_config);
         self.last_map_width = map_width;
         self.dirty = false;
     }
@@ -146,10 +146,11 @@ impl eframe::App for RamMapApp {
 
             let gutter_width = 130.0;
             let map_width = (ui.available_width() - gutter_width - 16.0).max(100.0);
+            let available_height = ui.available_height();
 
             // Recompute if dirty or if width changed significantly.
             if self.dirty || (self.last_map_width - map_width).abs() > 2.0 {
-                self.recompute_layout(map_width);
+                self.recompute_layout(map_width, available_height);
             }
 
             self.draw_map(ui, map_width, gutter_width);
@@ -160,15 +161,14 @@ impl eframe::App for RamMapApp {
 impl RamMapApp {
     fn draw_map(&mut self, ui: &mut egui::Ui, map_width: f32, gutter_width: f32) {
         let row_spacing = 3.0;
-        let num_rows = self.rows.len().max(1) as f32;
 
-        // Compute row height to fill available vertical space.
+        // Total height from layout-computed row heights.
+        let total_rows_height: f32 = self.rows.iter().map(|r| r.height_px).sum::<f32>()
+            + row_spacing * (self.rows.len().saturating_sub(1)) as f32;
         let legend_height = 40.0;
-        let avail_height = ui.available_height() - legend_height;
-        let row_height = ((avail_height - row_spacing * num_rows) / num_rows).clamp(28.0, 120.0);
 
         let total_width = gutter_width + map_width;
-        let total_height = num_rows * (row_height + row_spacing) + legend_height;
+        let total_height = total_rows_height + legend_height;
 
         // Clone rows to avoid borrow conflict.
         let rows = self.rows.clone();
@@ -185,13 +185,14 @@ impl RamMapApp {
                 let pointer = ui.input(|i| i.pointer.hover_pos());
 
                 let mut hovered = None;
+                let mut row_y = origin.y;
 
-                for (row_idx, row) in rows.iter().enumerate() {
+                for row in &rows {
                     if row.blocks.is_empty() {
                         continue;
                     }
 
-                    let row_y = origin.y + row_idx as f32 * (row_height + row_spacing);
+                    let row_height = row.height_px;
                     let blocks_x = origin.x + gutter_width;
 
                     // --- Address gutter ---
@@ -356,6 +357,8 @@ impl RamMapApp {
 
                         x += w;
                     }
+
+                    row_y += row_height + row_spacing;
                 }
 
                 self.hovered_region = hovered;
