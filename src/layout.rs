@@ -18,11 +18,7 @@ pub enum VisualBlock {
         px_width: f32,
     },
     /// A compressed gap marker.
-    Gap {
-        start: u64,
-        end: u64,
-        px_width: f32,
-    },
+    Gap { start: u64, end: u64, px_width: f32 },
 }
 
 impl VisualBlock {
@@ -47,45 +43,65 @@ impl VisualBlock {
         }
     }
 
-    /// The "weight" used for proportional sizing.
-    /// Uses log scale so 32 B and 512 KiB are both visible.
-    fn weight(&self) -> f64 {
+    /// The label text this block would display.
+    pub fn label_text(&self) -> String {
+        match self {
+            VisualBlock::Region { region, .. } => region.name.clone(),
+            VisualBlock::Gap { start, end, .. } => format_size_compact(*end - *start),
+        }
+    }
+
+    /// Minimum pixel width needed to display this block's label readably.
+    /// Accounts for character count + padding.
+    fn min_readable_px(&self) -> f32 {
+        let label = self.label_text();
+        let char_width = 7.0_f32; // approximate for proportional 11px font
+        let padding = 16.0; // left + right padding
+        let text_px = label.len() as f32 * char_width + padding;
+        // Gaps can be narrower — they're less important.
+        match self {
+            VisualBlock::Gap { .. } => text_px.max(40.0),
+            VisualBlock::Region { .. } => text_px.max(50.0),
+        }
+    }
+
+    /// Size bonus: extra pixels awarded proportional to byte size.
+    /// Larger regions get more visual weight beyond their label width.
+    /// Returns a bonus in pixels (will be scaled to fit the row).
+    fn size_bonus(&self) -> f32 {
         match self {
             VisualBlock::Region { region, .. } => {
                 let bytes = region.size().max(1) as f64;
-                // log2(bytes) gives ~5 for 32B, ~19 for 512K — a 4:1 ratio
-                // instead of 16000:1. We add a linear component to keep some
-                // proportionality for similar-sized regions.
-                let log_part = bytes.log2();
-                let lin_part = bytes.sqrt();
-                log_part + lin_part * 0.05
+                // sqrt gives gentle scaling: 1 KiB → 32, 1 MiB → 1024, 1 GiB → 32K
+                // We scale this down to a reasonable pixel bonus.
+                (bytes.sqrt() * 0.1) as f32
             }
-            VisualBlock::Gap { .. } => {
-                // Gaps get a fixed small weight.
-                GAP_WEIGHT
-            }
+            VisualBlock::Gap { .. } => 0.0, // gaps don't get size bonus
         }
     }
 }
 
-const GAP_WEIGHT: f64 = 6.0;
+/// Compact size formatting for gap labels.
+fn format_size_compact(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1}M", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.0}K", bytes as f64 / 1024.0)
+    } else {
+        format!("{}B", bytes)
+    }
+}
 
 /// Layout configuration.
 pub struct LayoutConfig {
     /// Gaps larger than this are compressed. Default: 64 KiB.
     pub gap_threshold: u64,
-    /// Minimum pixel width for any block (so tiny regions remain clickable).
-    pub min_block_px: f32,
-    /// Target number of blocks per row (soft target for row wrapping).
-    pub target_blocks_per_row: usize,
 }
 
 impl Default for LayoutConfig {
     fn default() -> Self {
         Self {
             gap_threshold: 64 * 1024,
-            min_block_px: 24.0,
-            target_blocks_per_row: 20,
         }
     }
 }
@@ -156,97 +172,102 @@ pub fn build_blocks(regions: &[MemoryRegion], config: &LayoutConfig) -> Vec<Visu
 
 /// Wrap blocks into rows and assign pixel widths.
 ///
-/// Each row fills exactly `row_px` pixels. Blocks are distributed based on
-/// their weight (log-compressed size), with a minimum pixel width enforced.
-pub fn layout_rows(blocks: Vec<VisualBlock>, row_px: f32, config: &LayoutConfig) -> Vec<VisualRow> {
+/// **Text-driven layout**: each block needs enough width to show its label.
+/// Rows are filled greedily — a block is added to the current row as long as
+/// all blocks in the row can still fit at their minimum readable width.
+/// After row assignment, surplus pixels are distributed proportionally to
+/// each block's size bonus, so larger regions appear visually bigger.
+pub fn layout_rows(
+    blocks: Vec<VisualBlock>,
+    row_px: f32,
+    _config: &LayoutConfig,
+) -> Vec<VisualRow> {
     if blocks.is_empty() {
         return Vec::new();
     }
 
-    // Step 1: split blocks into row groups.
-    // Strategy: greedily fill rows so that each has roughly
-    // `target_blocks_per_row` blocks, but also ensure that the minimum
-    // pixel width constraint is satisfiable (don't put so many blocks
-    // that they can't all fit at min_block_px).
-    let max_blocks_per_row = (row_px / config.min_block_px).floor() as usize;
-    let target = config.target_blocks_per_row.min(max_blocks_per_row).max(1);
-
+    // Step 1: greedily fill rows based on label widths.
     let mut row_groups: Vec<Vec<VisualBlock>> = Vec::new();
     let mut current: Vec<VisualBlock> = Vec::new();
+    let mut current_min_total: f32 = 0.0;
 
     for block in blocks {
-        current.push(block);
-        if current.len() >= target {
+        let block_min = block.min_readable_px();
+
+        // Would adding this block cause the row to exceed row_px
+        // when every block is at its minimum readable width?
+        if !current.is_empty() && current_min_total + block_min > row_px {
+            // Flush current row.
             row_groups.push(std::mem::take(&mut current));
+            current_min_total = 0.0;
         }
+
+        current_min_total += block_min;
+        current.push(block);
     }
     if !current.is_empty() {
         row_groups.push(current);
     }
 
-    // Step 2: for each row, assign pixel widths proportional to weight,
-    // then enforce min_block_px and redistribute.
+    // Step 2: for each row, assign pixel widths.
+    // Base width = min_readable_px, then distribute surplus proportionally
+    // to size_bonus.
     let mut rows: Vec<VisualRow> = Vec::new();
 
     for mut group in row_groups {
-        assign_pixel_widths(&mut group, row_px, config.min_block_px);
+        assign_text_driven_widths(&mut group, row_px);
         rows.push(VisualRow { blocks: group });
     }
 
     rows
 }
 
-/// Assign pixel widths to blocks in a single row, filling exactly `row_px`.
-fn assign_pixel_widths(blocks: &mut [VisualBlock], row_px: f32, min_px: f32) {
+/// Assign pixel widths to blocks in a row using text-driven sizing.
+///
+/// Each block starts at its minimum readable width. The remaining pixels
+/// (surplus) are distributed proportionally to each block's size_bonus,
+/// so that larger regions visually expand while all labels remain readable.
+fn assign_text_driven_widths(blocks: &mut [VisualBlock], row_px: f32) {
     let n = blocks.len();
     if n == 0 {
         return;
     }
 
-    // If every block at min_px already exceeds row_px, just distribute evenly.
-    if n as f32 * min_px > row_px {
-        let each = row_px / n as f32;
-        for b in blocks.iter_mut() {
-            b.set_px_width(each);
+    // Compute minimums.
+    let min_widths: Vec<f32> = blocks.iter().map(|b| b.min_readable_px()).collect();
+    let total_min: f32 = min_widths.iter().sum();
+
+    // If minimums already exceed row_px, scale everything down proportionally.
+    if total_min >= row_px {
+        let scale = row_px / total_min;
+        for (b, &mw) in blocks.iter_mut().zip(min_widths.iter()) {
+            b.set_px_width(mw * scale);
         }
         return;
     }
 
-    // Compute weights.
-    let weights: Vec<f64> = blocks.iter().map(|b| b.weight()).collect();
-    let total_weight: f64 = weights.iter().sum();
+    // Surplus pixels to distribute.
+    let surplus = row_px - total_min;
 
-    // First pass: proportional allocation.
-    let mut widths: Vec<f32> = weights
-        .iter()
-        .map(|w| ((w / total_weight) * row_px as f64) as f32)
-        .collect();
+    // Distribute surplus by size_bonus.
+    let bonuses: Vec<f32> = blocks.iter().map(|b| b.size_bonus()).collect();
+    let total_bonus: f32 = bonuses.iter().sum();
 
-    // Second pass: enforce minimum, then redistribute the excess from
-    // blocks that had to be enlarged.
-    let mut deficit = 0.0f32;
-    let mut flexible_weight = 0.0f64;
+    let mut widths = min_widths;
 
-    for i in 0..n {
-        if widths[i] < min_px {
-            deficit += min_px - widths[i];
-            widths[i] = min_px;
-        } else {
-            flexible_weight += weights[i];
-        }
-    }
-
-    // Subtract deficit proportionally from flexible blocks.
-    if deficit > 0.0 && flexible_weight > 0.0 {
+    if total_bonus > 0.0 {
         for i in 0..n {
-            if widths[i] > min_px {
-                let share = (weights[i] / flexible_weight) as f32 * deficit;
-                widths[i] = (widths[i] - share).max(min_px);
-            }
+            widths[i] += surplus * (bonuses[i] / total_bonus);
+        }
+    } else {
+        // No size bonus at all (e.g. row of only gaps) — distribute evenly.
+        let each = surplus / n as f32;
+        for w in &mut widths {
+            *w += each;
         }
     }
 
-    // Final pass: correct any floating point drift so sum == row_px exactly.
+    // Correct floating point drift.
     let sum: f32 = widths.iter().sum();
     let correction = row_px - sum;
     // Apply correction to the widest block.
