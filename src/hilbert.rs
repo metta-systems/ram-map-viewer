@@ -9,32 +9,12 @@ pub fn d2xy(order: u32, d: u32) -> (u32, u32) {
     let n = 1u32 << order;
     let mut x = 0u32;
     let mut y = 0u32;
-    let mut rx;
-    let mut ry;
     let mut d = d;
     let mut s = 1u32;
 
     while s < n {
-        rx = if (d & 2) != 0 { 1 } else { 0 };
-        ry = if (d & 1) != 0 { 1 } else { 0 };
-        // When rx == 0, we need to flip
-        ry ^= rx; // ry = (d & 1) ^ rx
-        // Wait — let me use the canonical algorithm properly.
-        // Reset and redo.
-        // Actually, let me just implement it correctly from scratch.
-        let _ = (rx, ry, x, y);
-        break;
-    }
-
-    // Canonical implementation (Wikipedia / Skilling variant):
-    x = 0;
-    y = 0;
-    d = d;
-    s = 1;
-
-    while s < n {
-        rx = (d / 2) & 1;
-        ry = (d ^ rx) & 1;
+        let rx = (d / 2) & 1;
+        let ry = (d ^ rx) & 1;
         rotate(s, &mut x, &mut y, rx, ry);
         x += s * rx;
         y += s * ry;
@@ -42,12 +22,14 @@ pub fn d2xy(order: u32, d: u32) -> (u32, u32) {
         s *= 2;
     }
 
-    (x, y)
+    (y, x) // swapped: addresses now flow left→right first
 }
 
 /// Convert 2D coordinates (x, y) to a 1D distance `d` along a Hilbert curve
 /// of the given `order`.
-pub fn xy2d(order: u32, mut x: u32, mut y: u32) -> u32 {
+pub fn xy2d(order: u32, x: u32, y: u32) -> u32 {
+    let (mut x, mut y) = (y, x); // match the swap in d2xy
+
     let n = 1u32 << order;
     let mut d = 0u32;
     let mut s = n / 2;
